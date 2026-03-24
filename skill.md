@@ -50,6 +50,7 @@ bash ~/.claude/skills/web-access/scripts/check-deps.sh
 | URL 已知，需要原始 HTML 源码（meta、JSON-LD 等结构化字段） | **curl** |
 | 非公开内容，或已知静态层无效的平台（小红书、微信公众号等公开内容也被反爬限制） | **浏览器 CDP**（直接，跳过静态层） |
 | 需要登录态、交互操作，或需要像人一样在浏览器内自由导航探索 | **浏览器 CDP** |
+| 从 Excel 参考文献列表批量下载 PDF（含学术论文、网页、YouTube 字幕） | **fetch_refs.mjs** |
 
 浏览器 CDP 不要求 URL 已知——可从任意入口出发，通过页面内搜索、点击、跳转等方式找到目标内容。WebSearch、WebFetch、curl 均不处理登录态。
 
@@ -89,43 +90,46 @@ bash ~/.claude/skills/web-access/scripts/check-deps.sh
 
 ### Proxy API
 
-所有操作通过 curl 调用 HTTP API：
+所有操作通过 curl 调用 HTTP API。除 `/health` 外，所有端点需携带认证 token：
 
 ```bash
+# 读取 token（proxy 启动时自动生成到 ~/.claude/cdp-proxy-token）
+TOKEN=$(cat ~/.claude/cdp-proxy-token)
+
 # 列出用户已打开的 tab
-curl -s http://localhost:3456/targets
+curl -s "http://localhost:3456/targets?token=$TOKEN"
 
 # 创建新后台 tab（自动等待加载）
-curl -s "http://localhost:3456/new?url=https://example.com"
+curl -s "http://localhost:3456/new?url=https://example.com&token=$TOKEN"
 
 # 页面信息
-curl -s "http://localhost:3456/info?target=ID"
+curl -s "http://localhost:3456/info?target=ID&token=$TOKEN"
 
 # 执行任意 JS：可读写 DOM、提取数据、操控元素、触发状态变更、提交表单、调用内部方法
-curl -s -X POST "http://localhost:3456/eval?target=ID" -d 'document.title'
+curl -s -X POST "http://localhost:3456/eval?target=ID&token=$TOKEN" -d 'document.title'
 
 # 捕获页面渲染状态（含视频当前帧）
-curl -s "http://localhost:3456/screenshot?target=ID&file=/tmp/shot.png"
+curl -s "http://localhost:3456/screenshot?target=ID&file=/tmp/shot.png&token=$TOKEN"
 
 # 导航、后退
-curl -s "http://localhost:3456/navigate?target=ID&url=URL"
-curl -s "http://localhost:3456/back?target=ID"
+curl -s "http://localhost:3456/navigate?target=ID&url=URL&token=$TOKEN"
+curl -s "http://localhost:3456/back?target=ID&token=$TOKEN"
 
 # 点击（POST body 为 CSS 选择器）— JS el.click()，简单快速，覆盖大多数场景
-curl -s -X POST "http://localhost:3456/click?target=ID" -d 'button.submit'
+curl -s -X POST "http://localhost:3456/click?target=ID&token=$TOKEN" -d 'button.submit'
 
 # 真实鼠标点击 — CDP Input.dispatchMouseEvent，算用户手势，能触发文件对话框
-curl -s -X POST "http://localhost:3456/clickAt?target=ID" -d 'button.upload'
+curl -s -X POST "http://localhost:3456/clickAt?target=ID&token=$TOKEN" -d 'button.upload'
 
 # 文件上传 — 直接设置 file input 的本地文件路径，绕过文件对话框
-curl -s -X POST "http://localhost:3456/setFiles?target=ID" -d '{"selector":"input[type=file]","files":["/path/to/file.png"]}'
+curl -s -X POST "http://localhost:3456/setFiles?target=ID&token=$TOKEN" -d '{"selector":"input[type=file]","files":["/path/to/file.png"]}'
 
 # 滚动（触发懒加载）
-curl -s "http://localhost:3456/scroll?target=ID&y=3000"
-curl -s "http://localhost:3456/scroll?target=ID&direction=bottom"
+curl -s "http://localhost:3456/scroll?target=ID&y=3000&token=$TOKEN"
+curl -s "http://localhost:3456/scroll?target=ID&direction=bottom&token=$TOKEN"
 
 # 关闭 tab
-curl -s "http://localhost:3456/close?target=ID"
+curl -s "http://localhost:3456/close?target=ID&token=$TOKEN"
 ```
 
 ### 页面内导航
@@ -205,6 +209,35 @@ Proxy 持续运行，不建议主动停止——重启后需要在 Chrome 中重
 | 工具能力/用法 | 官方文档、源码 |
 
 **找不到官网时**：权威媒体的原创报道（非转载）可作为次级依据，但需向用户说明："未找到官方原文，以下核实来自[媒体名]报道，存在转述误差可能。"单一来源时同样向用户声明。
+
+## 批量参考文献下载
+
+用户需要从参考文献列表批量下载文件时，使用 `fetch_refs.mjs`：
+
+```bash
+node ${CLAUDE_SKILL_DIR}/scripts/fetch_refs.mjs <excel_path> <start> <end> [output_dir]
+```
+
+**Excel 格式**：第一行为标题行，后续每行格式为：
+```
+N. Title, accessed Date, https://url
+```
+
+**URL 类型自动识别**：
+
+| 类型 | 判断条件 | 处理方式 |
+|------|---------|---------|
+| `direct_pdf` | URL 以 `.pdf` 结尾或路径含 `/pdf/` | 直接 HTTP 下载 |
+| `researchgate` | `researchgate.net` | CDP 打开页面，等待 Cloudflare 通过 |
+| `pmc` / `pubmed` / `frontiersin` | 对应域名 | CDP printToPDF（含 Readability 提取）|
+| `youtube` | `youtube.com` / `youtu.be` | yt-dlp 下载字幕，转为 PDF |
+| `html` | 其余所有 URL | CDP printToPDF（优先 Readability 提取正文）|
+
+下载后若文件实为 `.doc`/`.docx`，自动调用 Word COM 转换为 PDF（仅 Windows）。
+
+**依赖**：Node.js 22+、Python 3 + openpyxl、Chrome 开启远程调试（端口 9222）、yt-dlp（YouTube）、pywin32（Word 转 PDF）
+
+**触发场景**：用户说"下载参考文献"、"批量下载论文"、"把参考文献列表里的链接都下载下来"等。
 
 ## 站点经验
 

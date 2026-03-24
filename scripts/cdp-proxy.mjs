@@ -9,8 +9,45 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import net from 'node:net';
+import crypto from 'node:crypto';
 
 const PORT = parseInt(process.env.CDP_PROXY_PORT || '3456');
+
+// --- 安全：Token 认证 ---
+const TOKEN_FILE = path.join(os.homedir(), '.claude', 'cdp-proxy-token');
+const AUTH_TOKEN = crypto.randomBytes(24).toString('hex');
+
+function writeToken() {
+  fs.mkdirSync(path.dirname(TOKEN_FILE), { recursive: true });
+  fs.writeFileSync(TOKEN_FILE, AUTH_TOKEN, { mode: 0o600 });
+}
+
+function checkAuth(req, res) {
+  const parsed = new URL(req.url, `http://localhost:${PORT}`);
+  const token = parsed.searchParams.get('token') || req.headers['x-cdp-token'];
+  if (token !== AUTH_TOKEN) {
+    res.statusCode = 403;
+    res.end(JSON.stringify({ error: '认证失败。token 位于 ' + TOKEN_FILE }));
+    return false;
+  }
+  return true;
+}
+
+// --- 安全：URL scheme 白名单 ---
+function isAllowedUrl(url) {
+  if (!url || url === 'about:blank') return true;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch { return false; }
+}
+
+// --- 安全：截图文件路径限制 ---
+function isSafeScreenshotPath(filePath) {
+  const resolved = path.resolve(filePath);
+  const tmpDir = os.tmpdir();
+  return resolved.startsWith(tmpDir + path.sep) || resolved.startsWith(tmpDir);
+}
 let ws = null;
 let cmdId = 0;
 const pending = new Map(); // id -> {resolve, timer}
@@ -109,9 +146,16 @@ function getWebSocketUrl(port, wsPath) {
 // --- WebSocket 连接管理 ---
 let chromePort = null;
 let chromeWsPath = null;
+let connectPromise = null;
 
 async function connect() {
   if (ws && (ws.readyState === WS.OPEN || ws.readyState === 1)) return;
+  if (connectPromise) return connectPromise;
+  connectPromise = doConnect().finally(() => { connectPromise = null; });
+  return connectPromise;
+}
+
+async function doConnect() {
 
   if (!chromePort) {
     const discovered = await discoverChromePort();
@@ -245,9 +289,13 @@ async function waitForLoad(sessionId, timeoutMs = 15000) {
 }
 
 // --- 读取 POST body ---
+const MAX_BODY_SIZE = 1024 * 1024; // 1MB
 async function readBody(req) {
   let body = '';
-  for await (const chunk of req) body += chunk;
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > MAX_BODY_SIZE) throw new Error('请求体过大（限 1MB）');
+  }
   return body;
 }
 
@@ -260,12 +308,15 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
   try {
-    // /health 不需要连接 Chrome
+    // /health 不需要认证和连接 Chrome
     if (pathname === '/health') {
       const connected = ws && (ws.readyState === WS.OPEN || ws.readyState === 1);
       res.end(JSON.stringify({ status: 'ok', connected, sessions: sessions.size, chromePort }));
       return;
     }
+
+    // 其他所有端点需要认证
+    if (!checkAuth(req, res)) return;
 
     await connect();
 
@@ -279,6 +330,11 @@ const server = http.createServer(async (req, res) => {
     // GET /new?url=xxx - 创建新后台 tab
     else if (pathname === '/new') {
       const targetUrl = q.url || 'about:blank';
+      if (!isAllowedUrl(targetUrl)) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: '仅允许 http/https URL 或 about:blank' }));
+        return;
+      }
       const resp = await sendCDP('Target.createTarget', { url: targetUrl, background: true });
       const targetId = resp.result.targetId;
 
@@ -302,6 +358,11 @@ const server = http.createServer(async (req, res) => {
 
     // GET /navigate?target=xxx&url=yyy - 导航（自动等待加载）
     else if (pathname === '/navigate') {
+      if (!isAllowedUrl(q.url)) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: '仅允许 http/https URL 或 about:blank' }));
+        return;
+      }
       const sid = await ensureSession(q.target);
       const resp = await sendCDP('Page.navigate', { url: q.url }, sid);
 
@@ -422,6 +483,14 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: '需要 selector 和 files 字段' }));
         return;
       }
+      // 安全：校验所有文件路径存在
+      for (const f of body.files) {
+        if (!fs.existsSync(f)) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: '文件不存在: ' + f }));
+          return;
+        }
+      }
       // 获取 DOM 节点
       await sendCDP('DOM.enable', {}, sid);
       const doc = await sendCDP('DOM.getDocument', {}, sid);
@@ -475,6 +544,11 @@ const server = http.createServer(async (req, res) => {
         quality: format === 'jpeg' ? 80 : undefined,
       }, sid);
       if (q.file) {
+        if (!isSafeScreenshotPath(q.file)) {
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: '截图文件只能保存到临时目录: ' + os.tmpdir() }));
+          return;
+        }
         fs.writeFileSync(q.file, Buffer.from(resp.result.data, 'base64'));
         res.end(JSON.stringify({ saved: q.file }));
       } else {
@@ -487,7 +561,7 @@ const server = http.createServer(async (req, res) => {
     else if (pathname === '/info') {
       const sid = await ensureSession(q.target);
       const resp = await sendCDP('Runtime.evaluate', {
-        expression: 'JSON.stringify({title: document.title, url: location.href, ready: document.readyState})',
+        expression: 'JSON.stringify({title: document.title, url: location.href, readyState: document.readyState})',
         returnByValue: true,
       }, sid);
       res.end(resp.result?.result?.value || '{}');
@@ -506,9 +580,11 @@ const server = http.createServer(async (req, res) => {
           '/back?target=': 'GET - 后退',
           '/info?target=': 'GET - 页面标题/URL/状态',
           '/eval?target=': 'POST body=JS表达式 - 执行 JS',
-          '/click?target=': 'POST body=CSS选择器 - 点击元素',
+          '/click?target=': 'POST body=CSS选择器 - JS 层面点击',
+          '/clickAt?target=': 'POST body=CSS选择器 - CDP 真实鼠标点击',
+          '/setFiles?target=': 'POST body=JSON{selector,files} - 设置文件上传',
           '/scroll?target=&y=&direction=': 'GET - 滚动页面',
-          '/screenshot?target=&file=': 'GET - 截图',
+          '/screenshot?target=&file=': 'GET - 截图（file 限 tmpdir）',
         },
       }));
     }
@@ -529,6 +605,9 @@ function checkPortAvailable(port) {
 }
 
 async function main() {
+  // 写入认证 token 文件
+  writeToken();
+
   // 检查是否已有 proxy 在运行
   const available = await checkPortAvailable(PORT);
   if (!available) {

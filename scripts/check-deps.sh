@@ -15,34 +15,25 @@ else
   exit 1
 fi
 
-# Chrome 调试端口（9222）— TCP 探测，不建立真实连接（跨平台）
-if ! node -e "
-const net = require('net');
-const s = net.createConnection(9222, '127.0.0.1');
-s.on('connect', () => { process.exit(0); });
-s.on('error', () => process.exit(1));
-setTimeout(() => process.exit(1), 2000);
-" 2>/dev/null; then
-  echo "chrome: not connected — 请打开 chrome://inspect/#remote-debugging 并勾选 Allow remote debugging"
-  exit 1
-fi
-echo "chrome: ok (port 9222)"
-
 # CDP Proxy — 已运行则跳过，未运行则启动并等待连接
+# Chrome 端口检测由 proxy 自动完成（DevToolsActivePort + 多端口扫描）
 HEALTH=$(curl -s --connect-timeout 2 "http://127.0.0.1:3456/health" 2>/dev/null)
 if echo "$HEALTH" | grep -q '"connected":true'; then
+  echo "chrome: ok (via proxy)"
   echo "proxy: ready"
 else
   if ! echo "$HEALTH" | grep -q '"ok"'; then
     echo "proxy: starting..."
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    node "$SCRIPT_DIR/cdp-proxy.mjs" > /tmp/cdp-proxy.log 2>&1 &
+    LOG_DIR="$HOME/.claude/logs"
+    mkdir -p "$LOG_DIR"
+    node "$SCRIPT_DIR/cdp-proxy.mjs" > "$LOG_DIR/cdp-proxy.log" 2>&1 &
   fi
-  for i in $(seq 1 15); do
+  for ((i=1; i<=15; i++)); do
     sleep 1
-    curl -s http://localhost:3456/health | grep -q '"connected":true' && echo "proxy: ready" && exit 0
-    [ $i -eq 3 ] && echo "⚠️  Chrome 可能有授权弹窗，请点击「允许」后等待连接..."
+    curl -s http://localhost:3456/health | grep -q '"connected":true' && echo "chrome: ok (via proxy)" && echo "proxy: ready" && exit 0
+    [ $i -eq 3 ] && echo "[WARN] Chrome 可能有授权弹窗，请点击「允许」后等待连接..."
   done
-  echo "❌ 连接超时，请检查 Chrome 调试设置"
+  echo "[ERROR] 连接超时，请检查 Chrome 调试设置"
   exit 1
 fi
