@@ -105,11 +105,11 @@ function startProxyDetached() {
 }
 
 async function ensureProxy() {
-  const targetsUrl = `http://127.0.0.1:${PROXY_PORT}/targets`;
+  const healthUrl = `http://127.0.0.1:${PROXY_PORT}/health`;
 
-  // /targets 返回 JSON 数组即 ready
-  const targets = await httpGetJson(targetsUrl);
-  if (Array.isArray(targets)) {
+  // /health 不需要 token，返回 {"connected":true} 即 ready
+  const health = await httpGetJson(healthUrl);
+  if (health?.connected === true) {
     console.log('proxy: ready');
     return true;
   }
@@ -122,8 +122,8 @@ async function ensureProxy() {
   await new Promise((r) => setTimeout(r, 2000));
 
   for (let i = 1; i <= 15; i++) {
-    const result = await httpGetJson(targetsUrl, 8000);
-    if (Array.isArray(result)) {
+    const result = await httpGetJson(healthUrl, 8000);
+    if (result?.connected === true) {
       console.log('proxy: ready');
       return true;
     }

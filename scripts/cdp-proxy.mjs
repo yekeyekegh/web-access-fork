@@ -320,6 +320,7 @@ async function connect() {
       chromePort = null; // 重置端口缓存，下次连接重新发现
       chromeWsPath = null;
       sessions.clear();
+      portGuardedSessions.clear();
       workWindowId = null;
     };
     const onMessage = (evt) => {
