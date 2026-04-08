@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// CDP Proxy - 通过 HTTP API 操控用户日常 Chrome
-// 要求：Chrome 已开启 --remote-debugging-port
+// CDP Proxy - 通过 HTTP API 操控 Chrome
+// 支持自动启动独立 Chrome 实例或连接已有 Chrome
 // Node.js 22+（使用原生 WebSocket）
 
 import http from 'node:http';
@@ -10,8 +10,18 @@ import path from 'node:path';
 import os from 'node:os';
 import net from 'node:net';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 
 const PORT = parseInt(process.env.CDP_PROXY_PORT || '3456');
+
+// --- 配置：独立 Chrome 实例 ---
+const LAUNCH_CHROME = process.env.CDP_LAUNCH_CHROME !== '0'; // 默认启用：连不上已有 Chrome 时自动启动
+const CHROME_HEADLESS = process.env.CDP_CHROME_HEADLESS === '1';
+const CHROME_PORT = 9222; // Chrome 调试端口
+// 固定 profile 目录（保留登录态），不用临时目录
+const USER_DATA_DIR = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), '.local/share'), 'Google/Chrome/Debug Data');
+let chromeProcess = null; // 独立 Chrome 进程引用
+let isAutoLaunched = false; // 标记是否由本脚本启动的 Chrome
 
 // --- 安全：Token 认证 ---
 const TOKEN_FILE = path.join(os.homedir(), '.claude', 'cdp-proxy-token');
@@ -52,6 +62,132 @@ let ws = null;
 let cmdId = 0;
 const pending = new Map(); // id -> {resolve, timer}
 const sessions = new Map(); // targetId -> sessionId
+let workWindowId = null; // 工作窗口 ID，第一个 tab 开新窗口，后续复用
+
+// --- 检测 Chrome 可执行文件路径 ---
+function findChromeExecutable() {
+  const platform = os.platform();
+  const possiblePaths = [];
+
+  if (platform === 'win32') {
+    const programFiles = process.env['ProgramFiles(x86)'] || process.env['ProgramFiles'] || 'C:\\Program Files (x86)';
+    const programFiles64 = process.env['ProgramW6432'] || 'C:\\Program Files';
+    const localAppData = process.env['LOCALAPPDATA'] || '';
+    possiblePaths.push(
+      path.join(programFiles64, 'Google\\Chrome\\Application\\chrome.exe'),
+      path.join(programFiles, 'Google\\Chrome\\Application\\chrome.exe'),
+      path.join(localAppData, 'Google\\Chrome\\Application\\chrome.exe'),
+      path.join(programFiles64, 'Chromium\\Application\\chrome.exe'),
+    );
+  } else if (platform === 'darwin') {
+    possiblePaths.push(
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+    );
+  } else {
+    // Linux
+    possiblePaths.push(
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium',
+      '/usr/bin/chromium-browser',
+    );
+  }
+
+  for (const p of possiblePaths) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch { /* continue */ }
+  }
+
+  // 尝试从 PATH 查找
+  try {
+    const cmd = platform === 'win32' ? 'where chrome' : 'which google-chrome chromium chrome 2>/dev/null | head -1';
+    const result = require('child_process').execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
+    const found = result.trim().split('\n')[0];
+    if (found && fs.existsSync(found)) return found;
+  } catch { /* not found in PATH */ }
+
+  return null;
+}
+
+// --- 启动独立 Chrome 实例 ---
+async function launchChrome() {
+  const chromePath = findChromeExecutable();
+  if (!chromePath) {
+    throw new Error('未找到 Chrome 可执行文件，请确保 Chrome 已安装');
+  }
+
+  // 确保临时目录存在
+  fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+
+  const args = [
+    `--remote-debugging-port=${CHROME_PORT}`,
+    `--user-data-dir=${USER_DATA_DIR}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-background-networking',
+    '--disable-sync',
+    '--disable-translate',
+    '--disable-features=TranslateUI',
+    '--metrics-recording-only',
+    '--disable-popup-blocking',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-features=IsolateOrigins,site-per-process',
+    '--window-position=0,0',
+    '--window-size=1280,850',
+  ];
+
+  if (CHROME_HEADLESS) {
+    args.push('--headless=new');
+  }
+
+  console.log(`[CDP Proxy] 正在启动独立 Chrome 实例...`);
+  console.log(`[CDP Proxy] Chrome 路径: ${chromePath}`);
+  console.log(`[CDP Proxy] 数据目录: ${USER_DATA_DIR}`);
+
+  const env = { ...process.env };
+  delete env.NODE_OPTIONS; // 避免 Node 选项影响 Chrome
+
+  chromeProcess = spawn(chromePath, args, {
+    detached: !CHROME_HEADLESS, // 非无头模式时分离进程，避免控制台继承
+    stdio: CHROME_HEADLESS ? 'pipe' : 'ignore',
+    env,
+  });
+
+  isAutoLaunched = true;
+
+  // 等待 Chrome 启动完成（端口监听）
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    if (await checkPort(CHROME_PORT)) {
+      console.log(`[CDP Proxy] Chrome 已启动，调试端口: ${CHROME_PORT}`);
+      return CHROME_PORT;
+    }
+  }
+
+  throw new Error('Chrome 启动超时');
+}
+
+// --- 清理独立 Chrome 进程 ---
+function cleanupChrome() {
+  if (chromeProcess && !chromeProcess.killed) {
+    console.log('[CDP Proxy] 正在关闭独立 Chrome 实例...');
+    try {
+      if (process.platform === 'win32') {
+        spawn('taskkill', ['/pid', chromeProcess.pid, '/f', '/t'], { stdio: 'ignore' });
+      } else {
+        process.kill(-chromeProcess.pid, 'SIGTERM'); // 杀死整个进程组
+      }
+    } catch (e) {
+      console.error('[CDP Proxy] 关闭 Chrome 失败:', e.message);
+    }
+  }
+  // 注意：不清理 USER_DATA_DIR（Debug Data），保留登录态
+}
 
 // --- WebSocket 兼容层 ---
 let WS;
@@ -69,58 +205,47 @@ if (typeof globalThis.WebSocket !== 'undefined') {
   }
 }
 
+// --- 通过 /json/version 获取正确的 WebSocket URL ---
+async function getWsPathFromPort(port) {
+  try {
+    const data = await new Promise((resolve, reject) => {
+      http.get(`http://127.0.0.1:${port}/json/version`, { timeout: 3000 }, (res) => {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => resolve(JSON.parse(d)));
+      }).on('error', reject);
+    });
+    if (data.webSocketDebuggerUrl) {
+      return new URL(data.webSocketDebuggerUrl).pathname;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
 // --- 自动发现 Chrome 调试端口 ---
 async function discoverChromePort() {
-  // 1. 尝试读 DevToolsActivePort 文件
-  const possiblePaths = [];
   const platform = os.platform();
 
-  if (platform === 'darwin') {
-    const home = os.homedir();
-    possiblePaths.push(
-      path.join(home, 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
-      path.join(home, 'Library/Application Support/Google/Chrome Canary/DevToolsActivePort'),
-      path.join(home, 'Library/Application Support/Chromium/DevToolsActivePort'),
-    );
-  } else if (platform === 'linux') {
-    const home = os.homedir();
-    possiblePaths.push(
-      path.join(home, '.config/google-chrome/DevToolsActivePort'),
-      path.join(home, '.config/chromium/DevToolsActivePort'),
-    );
-  } else if (platform === 'win32') {
-    const localAppData = process.env.LOCALAPPDATA || '';
-    possiblePaths.push(
-      path.join(localAppData, 'Google/Chrome/User Data/DevToolsActivePort'),
-      path.join(localAppData, 'Chromium/User Data/DevToolsActivePort'),
-    );
+  // 1. 检测 9222 端口（--remote-debugging-port 启动的 Chrome）
+  if (await checkPort(CHROME_PORT)) {
+    const wsPath = await getWsPathFromPort(CHROME_PORT);
+    if (wsPath) {
+      console.log(`[CDP Proxy] 检测到 Chrome 调试端口: ${CHROME_PORT} (wsPath: ${wsPath})`);
+      return { port: CHROME_PORT, wsPath };
+    }
+    // 端口被占用但无法获取 wsPath → 不健康的实例，跳过
+    console.log(`[CDP Proxy] 端口 ${CHROME_PORT} 被占用但无法获取 wsPath，跳过`);
   }
 
-  for (const p of possiblePaths) {
+  // 2. 9222 没有 Chrome，自动启动 Debug Data Chrome
+  if (LAUNCH_CHROME) {
+    console.log('[CDP Proxy] 未检测到 Chrome，自动启动...');
     try {
-      const content = fs.readFileSync(p, 'utf-8').trim();
-      const lines = content.split('\n');
-      const port = parseInt(lines[0]);
-      if (port > 0 && port < 65536) {
-        const ok = await checkPort(port);
-        if (ok) {
-          // 第二行是带 UUID 的 WebSocket 路径（如 /devtools/browser/xxx-xxx）
-          // 非显式 --remote-debugging-port 启动时，Chrome 可能只接受此路径
-          const wsPath = lines[1] || null;
-          console.log(`[CDP Proxy] 从 DevToolsActivePort 发现端口: ${port}${wsPath ? ' (带 wsPath)' : ''}`);
-          return { port, wsPath };
-        }
-      }
-    } catch { /* 文件不存在，继续 */ }
-  }
-
-  // 2. 扫描常用端口
-  const commonPorts = [9222, 9229, 9333];
-  for (const port of commonPorts) {
-    const ok = await checkPort(port);
-    if (ok) {
-      console.log(`[CDP Proxy] 扫描发现 Chrome 调试端口: ${port}`);
-      return { port, wsPath: null };
+      const port = await launchChrome();
+      const wsPath = await getWsPathFromPort(port);
+      return { port, wsPath };
+    } catch (e) {
+      console.error('[CDP Proxy] 自动启动 Chrome 失败:', e.message);
     }
   }
 
@@ -161,10 +286,11 @@ async function doConnect() {
     const discovered = await discoverChromePort();
     if (!discovered) {
       throw new Error(
-        'Chrome 未开启远程调试端口。请用以下方式启动 Chrome：\n' +
-        '  macOS: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222\n' +
-        '  Linux: google-chrome --remote-debugging-port=9222\n' +
-        '  或在 chrome://flags 中搜索 "remote debugging" 并启用'
+        'Chrome 未找到或未开启远程调试端口。\n' +
+        '如果 Chrome 已安装但无法启动，请检查：\n' +
+        '1. Chrome 是否已安装在默认位置\n' +
+        '2. 是否有权限启动 Chrome\n' +
+        '3. 手动启动 Chrome 并添加参数: --remote-debugging-port=9222'
       );
     }
     chromePort = discovered.port;
@@ -194,6 +320,7 @@ async function doConnect() {
       chromePort = null; // 重置端口缓存，下次连接重新发现
       chromeWsPath = null;
       sessions.clear();
+      workWindowId = null;
     };
     const onMessage = (evt) => {
       const data = typeof evt === 'string' ? evt : (evt.data || evt);
@@ -335,8 +462,21 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: '仅允许 http/https URL 或 about:blank' }));
         return;
       }
-      const resp = await sendCDP('Target.createTarget', { url: targetUrl, background: true });
+      // 第一个 tab 开新窗口，后续 tab 在同一工作窗口中打开
+      const useNewWindow = !workWindowId;
+      const resp = await sendCDP('Target.createTarget', { url: targetUrl, newWindow: useNewWindow, background: !useNewWindow });
       const targetId = resp.result.targetId;
+
+      // 记录工作窗口 ID
+      if (useNewWindow) {
+        try {
+          const sid = await ensureSession(targetId);
+          const winResp = await sendCDP('Browser.getWindowForTarget', { targetId });
+          if (winResp.result?.windowId) {
+            workWindowId = winResp.result.windowId;
+          }
+        } catch { /* 非致命 */ }
+      }
 
       // 等待页面加载
       if (targetUrl !== 'about:blank') {
@@ -346,7 +486,7 @@ const server = http.createServer(async (req, res) => {
         } catch { /* 非致命，继续 */ }
       }
 
-      res.end(JSON.stringify({ targetId }));
+      res.end(JSON.stringify({ targetId, newWindow: useNewWindow }));
     }
 
     // GET /close?target=xxx - 关闭 tab
@@ -642,6 +782,17 @@ process.on('uncaughtException', (e) => {
 });
 process.on('unhandledRejection', (e) => {
   console.error('[CDP Proxy] 未处理拒绝:', e?.message || e);
+});
+
+// 进程退出时清理独立 Chrome 实例
+process.on('exit', cleanupChrome);
+process.on('SIGINT', () => {
+  cleanupChrome();
+  process.exit(0);
+});
+process.on('SIGTERM', () => {
+  cleanupChrome();
+  process.exit(0);
 });
 
 main();
