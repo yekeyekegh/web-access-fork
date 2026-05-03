@@ -100,7 +100,7 @@ curl -s "http://localhost:3456/screenshot?target=ID&file=/tmp/shot.png"
 
 | 错误 | 原因 | 解决 |
 |------|------|------|
-| `Chrome 未开启远程调试端口` | Chrome 未开启远程调试 | 提示用户打开 `chrome://inspect/#remote-debugging` 并勾选 Allow |
+| `Chrome 未找到或未开启远程调试端口` | proxy 自启 Chrome 失败（找不到可执行文件 / 无权限） | 检查 Chrome 安装，或手动启动 Chrome 加 `--remote-debugging-port=9222` |
 | `attach 失败` | targetId 无效或 tab 已关闭 | 用 `/targets` 获取最新列表 |
 | `CDP 命令超时` | 页面长时间未响应 | 重试或检查 tab 状态 |
 | `端口已被占用` | 另一个 proxy 已在运行 | 已有实例可直接复用 |

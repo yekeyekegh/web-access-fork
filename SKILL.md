@@ -22,7 +22,7 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 
 未通过时引导用户完成设置：
 - **Node.js 22+**：必需（使用原生 WebSocket）。版本低于 22 可用但需安装 `ws` 模块。
-- **Chrome remote-debugging**：在 Chrome 地址栏打开 `chrome://inspect/#remote-debugging`，勾选 **"Allow remote debugging for this browser instance"** 即可，可能需要重启浏览器。
+- **Chrome**：proxy 自己负责生命周期——9222 上有 Chrome 就复用，没有就启动一个独立的 "Debug Data" 实例（固定 user-data-dir 保留登录态，与用户日常浏览器互不干扰）。无需手动开启 remote-debugging。
 
 检查通过后并必须在回复中向用户直接展示以下须知，再启动 CDP Proxy 执行操作：
 
@@ -101,7 +101,7 @@ node "${CLAUDE_SKILL_DIR}/scripts/find-url.mjs" [关键词...] [--only bookmarks
 node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 ```
 
-脚本会依次检查 Node.js、Chrome 端口，并确保 Proxy 已连接（未运行则自动启动并等待）。Proxy 启动后持续运行。
+脚本检查 Node.js 并确保 Proxy 就绪：proxy 未运行 → 启动；proxy 在跑但未连接 Chrome（残留状态） → 杀掉重启；proxy 健康 → 直接返回。Chrome 实例由 proxy 自己拉起或复用 9222 上已有的。Proxy 启动后持续运行。
 
 ### Proxy API
 
