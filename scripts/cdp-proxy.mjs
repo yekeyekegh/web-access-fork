@@ -12,19 +12,33 @@ import net from 'node:net';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 
-const PORT = parseInt(process.env.CDP_PROXY_PORT || '3456');
+export function resolveConfig(env = process.env) {
+  const proxyPort = parseInt(env.CDP_PROXY_PORT || '3456');
+  const chromePort = parseInt(env.CDP_CHROME_PORT || '9222');
+  const defaultUserDataDir = path.join(
+    env.LOCALAPPDATA || path.join(os.homedir(), '.local/share'),
+    'Google/Chrome/Debug Data');
+  const userDataDir = env.CDP_USER_DATA_DIR || defaultUserDataDir;
+  const defaultToken = path.join(os.homedir(), '.claude', 'cdp-proxy-token');
+  const tokenFile = env.CDP_TOKEN_FILE
+    || (proxyPort === 3456 ? defaultToken
+        : path.join(os.homedir(), '.claude', `cdp-proxy-token-${proxyPort}`));
+  return { proxyPort, chromePort, userDataDir, tokenFile };
+}
+
+const _cfg = resolveConfig();
+const PORT = _cfg.proxyPort;
+const CHROME_PORT = _cfg.chromePort;
+const USER_DATA_DIR = _cfg.userDataDir;
+const TOKEN_FILE = _cfg.tokenFile;
 
 // --- 配置：独立 Chrome 实例 ---
 const LAUNCH_CHROME = process.env.CDP_LAUNCH_CHROME !== '0'; // 默认启用：连不上已有 Chrome 时自动启动
 const CHROME_HEADLESS = process.env.CDP_CHROME_HEADLESS === '1';
-const CHROME_PORT = 9222; // Chrome 调试端口
-// 固定 profile 目录（保留登录态），不用临时目录
-const USER_DATA_DIR = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), '.local/share'), 'Google/Chrome/Debug Data');
 let chromeProcess = null; // 独立 Chrome 进程引用
 let isAutoLaunched = false; // 标记是否由本脚本启动的 Chrome
 
 // --- 安全：Token 认证 ---
-const TOKEN_FILE = path.join(os.homedir(), '.claude', 'cdp-proxy-token');
 const AUTH_TOKEN = crypto.randomBytes(24).toString('hex');
 
 function writeToken() {
@@ -898,4 +912,4 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-main();
+if (!process.env.CDP_PROXY_NO_MAIN) main();
