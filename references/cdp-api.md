@@ -6,6 +6,7 @@
 - 启动：`node ~/.claude/skills/web-access/scripts/cdp-proxy.mjs &`
 - 启动后持续运行，不建议主动停止（重启需 Chrome 重新授权）
 - 强制停止：`pkill -f cdp-proxy.mjs`
+- **鉴权**：除 `/health` 外所有端点需在 query 携带 token（`TOKEN=$(cat ~/.claude/cdp-proxy-token)`，调用追加 `?token=$TOKEN` 或 `&token=$TOKEN`）。下方示例为简洁从略，实际调用须补上。
 
 ## API 端点
 
@@ -21,10 +22,11 @@ curl -s http://localhost:3456/health
 curl -s http://localhost:3456/targets
 ```
 
-### GET /new?url=URL
+### POST /new （body=URL）
 创建新后台 tab，自动等待页面加载完成。返回 `{ targetId }`.
+URL 通过 POST body 原样传入（v2.5.3 起），避免目标 URL 含 query 时未编码的 `&` 被当作 proxy 自身参数分隔符切断。
 ```bash
-curl -s "http://localhost:3456/new?url=https://example.com"
+curl -s -X POST --data-raw 'https://example.com' "http://localhost:3456/new"
 ```
 
 ### GET /close?target=ID
@@ -33,10 +35,10 @@ curl -s "http://localhost:3456/new?url=https://example.com"
 curl -s "http://localhost:3456/close?target=TARGET_ID"
 ```
 
-### GET /navigate?target=ID&url=URL
-在已有 tab 中导航到新 URL，自动等待加载。
+### POST /navigate?target=ID （body=URL）
+在已有 tab 中导航到新 URL，自动等待加载。target 走 query，URL 走 POST body（v2.5.3 起，理由同 /new）。
 ```bash
-curl -s "http://localhost:3456/navigate?target=ID&url=https://example.com"
+curl -s -X POST --data-raw 'https://example.com' "http://localhost:3456/navigate?target=ID"
 ```
 
 ### GET /back?target=ID
@@ -100,7 +102,7 @@ curl -s "http://localhost:3456/screenshot?target=ID&file=/tmp/shot.png"
 
 | 错误 | 原因 | 解决 |
 |------|------|------|
-| `Chrome 未开启远程调试端口` | Chrome 未开启远程调试 | 提示用户打开 `chrome://inspect/#remote-debugging` 并勾选 Allow |
+| `Chrome 未找到或未开启远程调试端口` | proxy 自启 Chrome 失败（找不到可执行文件 / 无权限） | 检查 Chrome 安装，或手动启动 Chrome 加 `--remote-debugging-port=9222` |
 | `attach 失败` | targetId 无效或 tab 已关闭 | 用 `/targets` 获取最新列表 |
 | `CDP 命令超时` | 页面长时间未响应 | 重试或检查 tab 状态 |
 | `端口已被占用` | 另一个 proxy 已在运行 | 已有实例可直接复用 |

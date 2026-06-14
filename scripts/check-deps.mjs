@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 // 环境检查 + 确保 CDP Proxy 就绪（跨平台，替代 check-deps.sh）
+//
+// Chrome 实例由 cdp-proxy.mjs 自己负责生命周期：
+//   - 9222 已有 Chrome → 复用
+//   - 9222 没有 → 启动独立 "Debug Data" 实例（固定 user-data-dir，保留登录态）
+// 本脚本不再尝试发现用户日常 Chrome——历史上读 DevToolsActivePort 会找到用户主浏览器，
+// 但 proxy 只看 9222，导致 "chrome: ok (port 57289)" 后 proxy 实际连不上。
 
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import fs from 'node:fs';
-import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROXY_SCRIPT = path.join(ROOT, 'scripts', 'cdp-proxy.mjs');
 const PROXY_PORT = Number(process.env.CDP_PROXY_PORT || 3456);
+const PROXY_LOG = path.join(os.tmpdir(), 'cdp-proxy.log');
 
 // --- Node.js 版本检查 ---
 
@@ -24,65 +30,7 @@ function checkNode() {
   }
 }
 
-// --- TCP 端口探测 ---
-
-function checkPort(port, host = '127.0.0.1', timeoutMs = 2000) {
-  return new Promise((resolve) => {
-    const socket = net.createConnection(port, host);
-    const timer = setTimeout(() => { socket.destroy(); resolve(false); }, timeoutMs);
-    socket.once('connect', () => { clearTimeout(timer); socket.destroy(); resolve(true); });
-    socket.once('error', () => { clearTimeout(timer); resolve(false); });
-  });
-}
-
-// --- Chrome 调试端口检测（DevToolsActivePort 多路径 + 常见端口回退） ---
-
-function activePortFiles() {
-  const home = os.homedir();
-  const localAppData = process.env.LOCALAPPDATA || '';
-  switch (os.platform()) {
-    case 'darwin':
-      return [
-        path.join(home, 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
-        path.join(home, 'Library/Application Support/Google/Chrome Canary/DevToolsActivePort'),
-        path.join(home, 'Library/Application Support/Chromium/DevToolsActivePort'),
-      ];
-    case 'linux':
-      return [
-        path.join(home, '.config/google-chrome/DevToolsActivePort'),
-        path.join(home, '.config/chromium/DevToolsActivePort'),
-      ];
-    case 'win32':
-      return [
-        path.join(localAppData, 'Google/Chrome/User Data/DevToolsActivePort'),
-        path.join(localAppData, 'Chromium/User Data/DevToolsActivePort'),
-      ];
-    default:
-      return [];
-  }
-}
-
-async function detectChromePort() {
-  // 优先从 DevToolsActivePort 文件读取
-  for (const filePath of activePortFiles()) {
-    try {
-      const lines = fs.readFileSync(filePath, 'utf8').trim().split(/\r?\n/).filter(Boolean);
-      const port = parseInt(lines[0], 10);
-      if (port > 0 && port < 65536 && await checkPort(port)) {
-        return port;
-      }
-    } catch (_) {}
-  }
-  // 回退：探测常见端口
-  for (const port of [9222, 9229, 9333]) {
-    if (await checkPort(port)) {
-      return port;
-    }
-  }
-  return null;
-}
-
-// --- CDP Proxy 启动与等待 ---
+// --- HTTP / 进程工具 ---
 
 function httpGetJson(url, timeoutMs = 3000) {
   return fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
@@ -92,9 +40,56 @@ function httpGetJson(url, timeoutMs = 3000) {
     .catch(() => null);
 }
 
+function findPidOnPort(port) {
+  try {
+    if (os.platform() === 'win32') {
+      const out = execSync('netstat -ano', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+      for (const line of out.split(/\r?\n/)) {
+        if (!line.includes('LISTENING')) continue;
+        const parts = line.trim().split(/\s+/);
+        const local = parts[1];
+        if (!local || !local.includes(':')) continue;
+        // 精确匹配端口尾段，避免 13456 误中 3456
+        if (local.split(':').pop() === String(port)) {
+          const pid = parseInt(parts[parts.length - 1], 10);
+          if (pid > 0) return pid;
+        }
+      }
+    } else {
+      try {
+        const out = execSync(`lsof -ti:${port} -sTCP:LISTEN`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+        const pid = parseInt(out.trim().split('\n')[0], 10);
+        if (pid > 0) return pid;
+      } catch { /* lsof 不存在或无匹配 */ }
+    }
+  } catch { /* netstat 偶发失败 */ }
+  return 0;
+}
+
+function killPid(pid) {
+  if (!pid || pid <= 0) return;
+  try {
+    if (os.platform() === 'win32') {
+      execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' });
+    } else {
+      process.kill(pid, 'SIGKILL');
+    }
+  } catch { /* 已死或无权限 */ }
+}
+
+function killStaleProxy() {
+  const pid = findPidOnPort(PROXY_PORT);
+  if (pid > 0) {
+    killPid(pid);
+    return pid;
+  }
+  return 0;
+}
+
+// --- CDP Proxy 启动与等待 ---
+
 function startProxyDetached() {
-  const logFile = path.join(os.tmpdir(), 'cdp-proxy.log');
-  const logFd = fs.openSync(logFile, 'a');
+  const logFd = fs.openSync(PROXY_LOG, 'a');
   const child = spawn(process.execPath, [PROXY_SCRIPT], {
     detached: true,
     stdio: ['ignore', logFd, logFd],
@@ -104,37 +99,57 @@ function startProxyDetached() {
   fs.closeSync(logFd);
 }
 
-async function ensureProxy() {
+async function waitForReady(maxSeconds = 25) {
   const healthUrl = `http://127.0.0.1:${PROXY_PORT}/health`;
-
-  // /health 不需要 token，返回 {"connected":true} 即 ready
-  const health = await httpGetJson(healthUrl);
-  if (health?.connected === true) {
-    console.log('proxy: ready');
-    return true;
-  }
-
-  // 未运行或未连接，启动并等待
-  console.log('proxy: connecting...');
-  startProxyDetached();
-
-  // 等 proxy 进程就绪
-  await new Promise((r) => setTimeout(r, 2000));
-
-  for (let i = 1; i <= 15; i++) {
-    const result = await httpGetJson(healthUrl, 8000);
-    if (result?.connected === true) {
-      console.log('proxy: ready');
-      return true;
-    }
-    if (i === 1) {
-      console.log('⚠️  Chrome 可能有授权弹窗，请点击「允许」后等待连接...');
+  for (let i = 1; i <= maxSeconds; i++) {
+    const h = await httpGetJson(healthUrl, 5000);
+    if (h?.connected === true) return h;
+    if (i === 3) {
+      console.log('  (Chrome 首次启动较慢；若弹出调试授权对话框请点「允许」)');
     }
     await new Promise((r) => setTimeout(r, 1000));
   }
+  return null;
+}
 
-  console.log('❌ 连接超时，请检查 Chrome 调试设置');
-  console.log(`  日志：${path.join(os.tmpdir(), 'cdp-proxy.log')}`);
+// 处理三种状态：
+//   1) proxy 健康（connected=true）          → 直接返回
+//   2) proxy 在跑但未连接 Chrome（残留状态） → 杀掉重启（自愈）
+//   3) proxy 未运行                          → 启动
+async function ensureProxy() {
+  const healthUrl = `http://127.0.0.1:${PROXY_PORT}/health`;
+  const initial = await httpGetJson(healthUrl);
+
+  if (initial?.connected === true) {
+    console.log(`proxy: ready (chromePort=${initial.chromePort}, sessions=${initial.sessions})`);
+    return true;
+  }
+
+  if (initial && initial.status === 'ok') {
+    // proxy 在跑但 connected != true（如 chromePort=null）→ 残留实例无法自愈，必须杀
+    const killedPid = killStaleProxy();
+    if (killedPid) {
+      console.log(`proxy: stale (running but disconnected, killed pid=${killedPid}), restarting...`);
+      await new Promise((r) => setTimeout(r, 1000));
+    } else {
+      console.log('proxy: stale but pid not found, attempting restart anyway...');
+    }
+  } else {
+    console.log('proxy: not running, starting...');
+  }
+
+  startProxyDetached();
+  // 给进程时间起来
+  await new Promise((r) => setTimeout(r, 1500));
+
+  const ready = await waitForReady(25);
+  if (ready) {
+    console.log(`proxy: ready (chromePort=${ready.chromePort}, sessions=${ready.sessions})`);
+    return true;
+  }
+
+  console.log('proxy: failed (timeout waiting for Chrome connection)');
+  console.log(`  日志：${PROXY_LOG}`);
   return false;
 }
 
@@ -142,18 +157,10 @@ async function ensureProxy() {
 
 async function main() {
   checkNode();
+  console.log('chrome: managed by proxy (auto-launches Debug Data instance on demand)');
 
-  const chromePort = await detectChromePort();
-  if (!chromePort) {
-    console.log('chrome: not connected — 请确保 Chrome 已打开，然后访问 chrome://inspect/#remote-debugging 并勾选 Allow remote debugging');
-    process.exit(1);
-  }
-  console.log(`chrome: ok (port ${chromePort})`);
-
-  const proxyOk = await ensureProxy();
-  if (!proxyOk) {
-    process.exit(1);
-  }
+  const ok = await ensureProxy();
+  if (!ok) process.exit(1);
 
   // 列出已有站点经验
   const patternsDir = path.join(ROOT, 'references', 'site-patterns');
@@ -164,8 +171,7 @@ async function main() {
     if (sites.length) {
       console.log(`\nsite-patterns: ${sites.join(', ')}`);
     }
-  } catch {}
-
+  } catch { /* 目录可能不存在 */ }
 }
 
 await main();

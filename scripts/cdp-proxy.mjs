@@ -62,6 +62,9 @@ let ws = null;
 let cmdId = 0;
 const pending = new Map(); // id -> {resolve, timer}
 const sessions = new Map(); // targetId -> sessionId
+const managedTabs = new Map(); // targetId -> { lastAccessed: number }
+const TAB_IDLE_TIMEOUT = parseInt(process.env.CDP_TAB_IDLE_TIMEOUT || '900000'); // 15 min default
+const CLEANUP_INTERVAL = 60000; // sweep every 60s
 let workWindowId = null; // 工作窗口 ID，第一个 tab 开新窗口，后续复用
 
 // --- 检测 Chrome 可执行文件路径 ---
@@ -321,6 +324,7 @@ async function connect() {
       chromeWsPath = null;
       sessions.clear();
       portGuardedSessions.clear();
+      managedTabs.clear();
       workWindowId = null;
     };
     const onMessage = (evt) => {
@@ -412,6 +416,35 @@ async function enablePortGuard(sessionId) {
   } catch { /* Fetch 域启用失败不影响主流程 */ }
 }
 
+// --- 闲置 Tab 自动清理 ---
+function touchTab(targetId) {
+  const entry = managedTabs.get(targetId);
+  if (entry) entry.lastAccessed = Date.now();
+}
+
+async function cleanupIdleTabs() {
+  if (!ws || (ws.readyState !== WS.OPEN && ws.readyState !== 1)) return;
+  const now = Date.now();
+  for (const [targetId, info] of managedTabs) {
+    if (now - info.lastAccessed < TAB_IDLE_TIMEOUT) continue;
+    try { await sendCDP('Target.closeTarget', { targetId }); } catch { /* tab may already be closed */ }
+    sessions.delete(targetId);
+    managedTabs.delete(targetId);
+    console.log(`[CDP Proxy] Auto-closed idle tab: ${targetId}`);
+  }
+}
+
+async function closeAllManagedTabs() {
+  if (!ws || (ws.readyState !== WS.OPEN && ws.readyState !== 1)) return;
+  const targets = [...managedTabs.keys()];
+  for (const targetId of targets) {
+    try { await sendCDP('Target.closeTarget', { targetId }); } catch { /* ignore */ }
+    sessions.delete(targetId);
+    managedTabs.delete(targetId);
+  }
+  if (targets.length) console.log(`[CDP Proxy] Shutdown: closed ${targets.length} managed tab(s)`);
+}
+
 // --- 等待页面加载 ---
 async function waitForLoad(sessionId, timeoutMs = 15000) {
   // 启用 Page 域
@@ -465,12 +498,15 @@ const server = http.createServer(async (req, res) => {
     // /health 不需要认证和连接 Chrome
     if (pathname === '/health') {
       const connected = ws && (ws.readyState === WS.OPEN || ws.readyState === 1);
-      res.end(JSON.stringify({ status: 'ok', connected, sessions: sessions.size, chromePort }));
+      res.end(JSON.stringify({ status: 'ok', connected, sessions: sessions.size, managedTabs: managedTabs.size, chromePort }));
       return;
     }
 
     // 其他所有端点需要认证
     if (!checkAuth(req, res)) return;
+
+    // 鉴权通过后再刷新 tab 活跃时间，避免未授权请求干扰闲置清理逻辑
+    if (q.target) touchTab(q.target);
 
     await connect();
 
@@ -481,9 +517,19 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(pages, null, 2));
     }
 
-    // GET /new?url=xxx - 创建新后台 tab
+    // POST /new (body=URL) - 创建新后台 tab
     else if (pathname === '/new') {
-      const targetUrl = q.url || 'about:blank';
+      if (req.method !== 'POST') {
+        res.statusCode = 400;
+        res.end(JSON.stringify({
+          error: 'v2.5.3 起 /new 改为 POST 传 URL（避免目标 URL 含 query 时被错误切分）',
+          migration: 'references/migration-2.5.3.md',
+          example: "curl -X POST --data-raw 'https://example.com' http://localhost:3456/new",
+        }));
+        return;
+      }
+      const body = (await readBody(req)).trim();
+      const targetUrl = body || 'about:blank';
       if (!isAllowedUrl(targetUrl)) {
         res.statusCode = 400;
         res.end(JSON.stringify({ error: '仅允许 http/https URL 或 about:blank' }));
@@ -493,6 +539,7 @@ const server = http.createServer(async (req, res) => {
       const useNewWindow = !workWindowId;
       const resp = await sendCDP('Target.createTarget', { url: targetUrl, newWindow: useNewWindow, background: !useNewWindow });
       const targetId = resp.result.targetId;
+      managedTabs.set(targetId, { lastAccessed: Date.now() });
 
       // 记录工作窗口 ID
       if (useNewWindow) {
@@ -520,18 +567,34 @@ const server = http.createServer(async (req, res) => {
     else if (pathname === '/close') {
       const resp = await sendCDP('Target.closeTarget', { targetId: q.target });
       sessions.delete(q.target);
+      managedTabs.delete(q.target);
       res.end(JSON.stringify(resp.result));
     }
 
-    // GET /navigate?target=xxx&url=yyy - 导航（自动等待加载）
+    // POST /navigate?target=xxx (body=URL) - 导航（自动等待加载）
     else if (pathname === '/navigate') {
-      if (!isAllowedUrl(q.url)) {
+      if (req.method !== 'POST') {
+        res.statusCode = 400;
+        res.end(JSON.stringify({
+          error: 'v2.5.3 起 /navigate 改为 POST 传 URL（避免目标 URL 含 query 时被错误切分）',
+          migration: 'references/migration-2.5.3.md',
+          example: "curl -X POST --data-raw 'https://example.com' 'http://localhost:3456/navigate?target=ID'",
+        }));
+        return;
+      }
+      const targetUrl = (await readBody(req)).trim();
+      if (!targetUrl) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: '/navigate 需要在 POST body 中提供目标 URL（body 不能为空）' }));
+        return;
+      }
+      if (!isAllowedUrl(targetUrl)) {
         res.statusCode = 400;
         res.end(JSON.stringify({ error: '仅允许 http/https URL 或 about:blank' }));
         return;
       }
       const sid = await ensureSession(q.target);
-      const resp = await sendCDP('Page.navigate', { url: q.url }, sid);
+      const resp = await sendCDP('Page.navigate', { url: targetUrl }, sid);
 
       // 等待页面加载完成
       await waitForLoad(sid);
@@ -741,9 +804,9 @@ const server = http.createServer(async (req, res) => {
         endpoints: {
           '/health': 'GET - 健康检查',
           '/targets': 'GET - 列出所有页面 tab',
-          '/new?url=': 'GET - 创建新后台 tab（自动等待加载）',
+          '/new': 'POST body=URL - 创建新后台 tab（自动等待加载）',
           '/close?target=': 'GET - 关闭 tab',
-          '/navigate?target=&url=': 'GET - 导航（自动等待加载）',
+          '/navigate?target=': 'POST body=URL - 导航（自动等待加载）',
           '/back?target=': 'GET - 后退',
           '/info?target=': 'GET - 页面标题/URL/状态',
           '/eval?target=': 'POST body=JS表达式 - 执行 JS',
@@ -801,6 +864,19 @@ async function main() {
     // 启动时尝试连接 Chrome（非阻塞）
     connect().catch(e => console.error('[CDP Proxy] 初始连接失败:', e.message, '（将在首次请求时重试）'));
   });
+
+  // 定时清理闲置 tab
+  const cleanupTimer = setInterval(cleanupIdleTabs, CLEANUP_INTERVAL);
+  cleanupTimer.unref();
+
+  const shutdown = async (sig) => {
+    console.log(`[CDP Proxy] ${sig}, cleaning up...`);
+    clearInterval(cleanupTimer);
+    await closeAllManagedTabs();
+    process.exit(0);
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 // 防止未捕获异常导致进程崩溃

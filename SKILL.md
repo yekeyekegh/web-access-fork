@@ -7,7 +7,7 @@ description:
   触发场景：用户要求搜索信息、查看网页内容、访问需要登录的网站、操作网页界面、抓取社交媒体内容（小红书、微博、推特等）、读取动态渲染页面、以及任何需要真实浏览器环境的网络任务。
 metadata:
   author: 一泽Eze
-  version: "2.4.3"
+  version: "2.5.3"
 ---
 
 # web-access Skill
@@ -22,7 +22,7 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 
 未通过时引导用户完成设置：
 - **Node.js 22+**：必需（使用原生 WebSocket）。版本低于 22 可用但需安装 `ws` 模块。
-- **Chrome remote-debugging**：在 Chrome 地址栏打开 `chrome://inspect/#remote-debugging`，勾选 **"Allow remote debugging for this browser instance"** 即可，可能需要重启浏览器。
+- **Chrome**：proxy 自己负责生命周期——9222 上有 Chrome 就复用，没有就启动一个独立的 "Debug Data" 实例（固定 user-data-dir 保留登录态，与用户日常浏览器互不干扰）。无需手动开启 remote-debugging。
 
 检查通过后并必须在回复中向用户直接展示以下须知，再启动 CDP Proxy 执行操作：
 
@@ -69,6 +69,16 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 
 浏览网页时，**先了解页面结构，再决定下一步动作**。不需要提前规划所有步骤。
 
+### 补充：本地 Chrome 资源
+
+用户指向**本人访问过的页面**（"我之前看的那个讲 X 的文章"、"上次打开过的 XX 面板"）或**组织内部系统**（"我们的 XX 平台"、"公司那个 YY 系统"等公网搜不到的目标）时，检索本地 Chrome 书签/历史：
+
+```bash
+node "${CLAUDE_SKILL_DIR}/scripts/find-url.mjs" [关键词...] [--only bookmarks|history] [--limit N] [--since 1d|7h|YYYY-MM-DD] [--sort recent|visits]
+```
+
+关键词空格分词、多词 AND，匹配 title + url（可省略）；`--since` / `--sort` 仅作用于历史；默认按最近访问倒序，`--sort visits` 按访问次数排序（适合"高频访问的网站"这类场景）。
+
 ### 程序化操作与 GUI 交互
 
 浏览器内操作页面有两种方式：
@@ -91,7 +101,7 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 ```
 
-脚本会依次检查 Node.js、Chrome 端口，并确保 Proxy 已连接（未运行则自动启动并等待）。Proxy 启动后持续运行。
+脚本检查 Node.js 并确保 Proxy 就绪：proxy 未运行 → 启动；proxy 在跑但未连接 Chrome（残留状态） → 杀掉重启；proxy 健康 → 直接返回。Chrome 实例由 proxy 自己拉起或复用 9222 上已有的。Proxy 启动后持续运行。
 
 ### Proxy API
 
@@ -104,8 +114,8 @@ TOKEN=$(cat ~/.claude/cdp-proxy-token)
 # 列出用户已打开的 tab
 curl -s "http://localhost:3456/targets?token=$TOKEN"
 
-# 创建新后台 tab（自动等待加载）
-curl -s "http://localhost:3456/new?url=https://example.com&token=$TOKEN"
+# 创建新后台 tab（自动等待加载）— URL 走 POST body，避免目标 URL 含 query 时被切分
+curl -s -X POST --data-raw 'https://example.com' "http://localhost:3456/new?token=$TOKEN"
 
 # 页面信息
 curl -s "http://localhost:3456/info?target=ID&token=$TOKEN"
@@ -116,8 +126,8 @@ curl -s -X POST "http://localhost:3456/eval?target=ID&token=$TOKEN" -d 'document
 # 捕获页面渲染状态（含视频当前帧）
 curl -s "http://localhost:3456/screenshot?target=ID&file=/tmp/shot.png&token=$TOKEN"
 
-# 导航、后退
-curl -s "http://localhost:3456/navigate?target=ID&url=URL&token=$TOKEN"
+# 导航（URL 走 POST body，target/token 走 query）、后退
+curl -s -X POST --data-raw 'https://example.com' "http://localhost:3456/navigate?target=ID&token=$TOKEN"
 curl -s "http://localhost:3456/back?target=ID&token=$TOKEN"
 
 # 点击（POST body 为 CSS 选择器）— JS el.click()，简单快速，覆盖大多数场景
