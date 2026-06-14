@@ -21,10 +21,11 @@ curl -s http://localhost:3456/health
 curl -s http://localhost:3456/targets
 ```
 
-### GET /new?url=URL
+### POST /new （body=URL）
 创建新后台 tab，自动等待页面加载完成。返回 `{ targetId }`.
+URL 通过 POST body 原样传入（v2.5.3 起），避免目标 URL 含 query 时未编码的 `&` 被当作 proxy 自身参数分隔符切断。
 ```bash
-curl -s "http://localhost:3456/new?url=https://example.com"
+curl -s -X POST --data-raw 'https://example.com' "http://localhost:3456/new"
 ```
 
 ### GET /close?target=ID
@@ -33,10 +34,10 @@ curl -s "http://localhost:3456/new?url=https://example.com"
 curl -s "http://localhost:3456/close?target=TARGET_ID"
 ```
 
-### GET /navigate?target=ID&url=URL
-在已有 tab 中导航到新 URL，自动等待加载。
+### POST /navigate?target=ID （body=URL）
+在已有 tab 中导航到新 URL，自动等待加载。target 走 query，URL 走 POST body（v2.5.3 起，理由同 /new）。
 ```bash
-curl -s "http://localhost:3456/navigate?target=ID&url=https://example.com"
+curl -s -X POST --data-raw 'https://example.com' "http://localhost:3456/navigate?target=ID"
 ```
 
 ### GET /back?target=ID

@@ -517,9 +517,19 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(pages, null, 2));
     }
 
-    // GET /new?url=xxx - 创建新后台 tab
+    // POST /new (body=URL) - 创建新后台 tab
     else if (pathname === '/new') {
-      const targetUrl = q.url || 'about:blank';
+      if (req.method !== 'POST') {
+        res.statusCode = 400;
+        res.end(JSON.stringify({
+          error: 'v2.5.3 起 /new 改为 POST 传 URL（避免目标 URL 含 query 时被错误切分）',
+          migration: 'references/migration-2.5.3.md',
+          example: "curl -X POST --data-raw 'https://example.com' http://localhost:3456/new",
+        }));
+        return;
+      }
+      const body = (await readBody(req)).trim();
+      const targetUrl = body || 'about:blank';
       if (!isAllowedUrl(targetUrl)) {
         res.statusCode = 400;
         res.end(JSON.stringify({ error: '仅允许 http/https URL 或 about:blank' }));
@@ -561,15 +571,25 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(resp.result));
     }
 
-    // GET /navigate?target=xxx&url=yyy - 导航（自动等待加载）
+    // POST /navigate?target=xxx (body=URL) - 导航（自动等待加载）
     else if (pathname === '/navigate') {
-      if (!isAllowedUrl(q.url)) {
+      if (req.method !== 'POST') {
+        res.statusCode = 400;
+        res.end(JSON.stringify({
+          error: 'v2.5.3 起 /navigate 改为 POST 传 URL（避免目标 URL 含 query 时被错误切分）',
+          migration: 'references/migration-2.5.3.md',
+          example: "curl -X POST --data-raw 'https://example.com' 'http://localhost:3456/navigate?target=ID'",
+        }));
+        return;
+      }
+      const targetUrl = (await readBody(req)).trim();
+      if (!isAllowedUrl(targetUrl)) {
         res.statusCode = 400;
         res.end(JSON.stringify({ error: '仅允许 http/https URL 或 about:blank' }));
         return;
       }
       const sid = await ensureSession(q.target);
-      const resp = await sendCDP('Page.navigate', { url: q.url }, sid);
+      const resp = await sendCDP('Page.navigate', { url: targetUrl }, sid);
 
       // 等待页面加载完成
       await waitForLoad(sid);
@@ -779,9 +799,9 @@ const server = http.createServer(async (req, res) => {
         endpoints: {
           '/health': 'GET - 健康检查',
           '/targets': 'GET - 列出所有页面 tab',
-          '/new?url=': 'GET - 创建新后台 tab（自动等待加载）',
+          '/new': 'POST body=URL - 创建新后台 tab（自动等待加载）',
           '/close?target=': 'GET - 关闭 tab',
-          '/navigate?target=&url=': 'GET - 导航（自动等待加载）',
+          '/navigate?target=': 'POST body=URL - 导航（自动等待加载）',
           '/back?target=': 'GET - 后退',
           '/info?target=': 'GET - 页面标题/URL/状态',
           '/eval?target=': 'POST body=JS表达式 - 执行 JS',

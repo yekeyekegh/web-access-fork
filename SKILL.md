@@ -7,7 +7,7 @@ description:
   触发场景：用户要求搜索信息、查看网页内容、访问需要登录的网站、操作网页界面、抓取社交媒体内容（小红书、微博、推特等）、读取动态渲染页面、以及任何需要真实浏览器环境的网络任务。
 metadata:
   author: 一泽Eze
-  version: "2.5.0"
+  version: "2.5.3"
 ---
 
 # web-access Skill
@@ -114,8 +114,8 @@ TOKEN=$(cat ~/.claude/cdp-proxy-token)
 # 列出用户已打开的 tab
 curl -s "http://localhost:3456/targets?token=$TOKEN"
 
-# 创建新后台 tab（自动等待加载）
-curl -s "http://localhost:3456/new?url=https://example.com&token=$TOKEN"
+# 创建新后台 tab（自动等待加载）— URL 走 POST body，避免目标 URL 含 query 时被切分
+curl -s -X POST --data-raw 'https://example.com' "http://localhost:3456/new?token=$TOKEN"
 
 # 页面信息
 curl -s "http://localhost:3456/info?target=ID&token=$TOKEN"
@@ -126,8 +126,8 @@ curl -s -X POST "http://localhost:3456/eval?target=ID&token=$TOKEN" -d 'document
 # 捕获页面渲染状态（含视频当前帧）
 curl -s "http://localhost:3456/screenshot?target=ID&file=/tmp/shot.png&token=$TOKEN"
 
-# 导航、后退
-curl -s "http://localhost:3456/navigate?target=ID&url=URL&token=$TOKEN"
+# 导航（URL 走 POST body，target/token 走 query）、后退
+curl -s -X POST --data-raw 'https://example.com' "http://localhost:3456/navigate?target=ID&token=$TOKEN"
 curl -s "http://localhost:3456/back?target=ID&token=$TOKEN"
 
 # 点击（POST body 为 CSS 选择器）— JS el.click()，简单快速，覆盖大多数场景
