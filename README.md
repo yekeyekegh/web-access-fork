@@ -156,8 +156,8 @@ Proxy 通过 WebSocket 直连 Chrome（兼容 `chrome://inspect` 方式，无需
 # 启动（Agent 会自动管理 Proxy 生命周期，无需手动启动）
 node "${CLAUDE_SKILL_DIR}/scripts/cdp-proxy.mjs" &
 
-# 页面操作
-curl -s "http://localhost:3456/new?url=https://example.com"     # 新建 tab
+# 页面操作（除 /health 外，所有端点需在 query 携带 &token=$TOKEN，下例从略；TOKEN=$(cat ~/.claude/cdp-proxy-token)）
+curl -s -X POST --data-raw 'https://example.com' "http://localhost:3456/new"   # 新建 tab（URL 走 POST body）
 curl -s -X POST "http://localhost:3456/eval?target=ID" -d 'document.title'  # 执行 JS
 curl -s -X POST "http://localhost:3456/click?target=ID" -d 'button.submit'  # JS 点击
 curl -s -X POST "http://localhost:3456/clickAt?target=ID" -d '.upload-btn'  # 真实鼠标点击

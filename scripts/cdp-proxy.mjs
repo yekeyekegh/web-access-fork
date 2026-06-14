@@ -583,6 +583,11 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const targetUrl = (await readBody(req)).trim();
+      if (!targetUrl) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: '/navigate 需要在 POST body 中提供目标 URL（body 不能为空）' }));
+        return;
+      }
       if (!isAllowedUrl(targetUrl)) {
         res.statusCode = 400;
         res.end(JSON.stringify({ error: '仅允许 http/https URL 或 about:blank' }));

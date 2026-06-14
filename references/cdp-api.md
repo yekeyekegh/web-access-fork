@@ -6,6 +6,7 @@
 - 启动：`node ~/.claude/skills/web-access/scripts/cdp-proxy.mjs &`
 - 启动后持续运行，不建议主动停止（重启需 Chrome 重新授权）
 - 强制停止：`pkill -f cdp-proxy.mjs`
+- **鉴权**：除 `/health` 外所有端点需在 query 携带 token（`TOKEN=$(cat ~/.claude/cdp-proxy-token)`，调用追加 `?token=$TOKEN` 或 `&token=$TOKEN`）。下方示例为简洁从略，实际调用须补上。
 
 ## API 端点
 
