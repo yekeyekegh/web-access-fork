@@ -579,9 +579,12 @@ const server = http.createServer(async (req, res) => {
 
     // GET /close?target=xxx - 关闭 tab
     else if (pathname === '/close') {
-      const resp = await sendCDP('Target.closeTarget', { targetId: q.target });
-      sessions.delete(q.target);
-      managedTabs.delete(q.target);
+      const tid = q.target;
+      const resp = await sendCDP('Target.closeTarget', { targetId: tid });
+      const sid = sessions.get(tid);
+      if (sid) portGuardedSessions.delete(sid);   // 补:清端口拦截 session 记录
+      sessions.delete(tid);
+      managedTabs.delete(tid);
       res.end(JSON.stringify(resp.result));
     }
 
