@@ -30,6 +30,7 @@
 - **token 鉴权**：除 `/health` 外所有 proxy 端点需 `?token=$TOKEN`（query）。上游无鉴权——故上游来源的文档示例都缺 token，移植时须补充说明。
 - **`isAllowedUrl` 白名单**、`workWindowId`/newWindow 逻辑、截图路径限制等安全加固（commit `f981930`）。
 - **`fetch_refs.mjs`**（见上）。
+- **触发门槛：升级层而非默认层**（2026-08-12）。上游 description 写「所有联网操作必须通过此 skill 处理」，实测导致 skill 在 WebSearch / WebFetch 之前就被抢先触发，普通公开网页查询也要启动 Chrome，代价与延迟都不必要。本 fork 改为：description 明确声明本 skill 是升级层，只在内置工具**实际失败**（被墙 / 超时 / 403 / 反爬 / 需登录 / JS 动态渲染 / 需交互）或目标平台已知静态层无效时加载；SKILL.md 正文顶部新增「分级降级（最先执行）」小节，把「先内置工具、失败再 CDP、升级须说明理由」写成加载后的第一条指令；「联网工具选择」表补一句「能用上面的就不用下面的」。sync 时上游若改动 description，勿跟随覆盖。
 
 ---
 
